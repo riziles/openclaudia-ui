@@ -83,6 +83,60 @@ fn find_openclaudia_binary() -> anyhow::Result<PathBuf> {
     Ok(PathBuf::from("openclaudia"))
 }
 
+/// Resolve the default model from the project's `.openclaudia/config.yaml`.
+/// Returns the model name (e.g. "deepseek-v4-pro") or "openclaudia" as fallback.
+fn resolve_config_model() -> anyhow::Result<String> {
+    let config_path = std::env::current_dir()?.join(".openclaudia").join("config.yaml");
+    if !config_path.exists() {
+        return Ok("openclaudia".to_string());
+    }
+    let config: serde_json::Value = serde_yaml::from_str(
+        &std::fs::read_to_string(&config_path)?
+    ).unwrap_or_default();
+
+    // Try provider.model first, then fall back to proxy.target
+    let target = config["proxy"]["target"].as_str().unwrap_or("anthropic");
+    let model = config["providers"][target]["model"]
+        .as_str()
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| target.to_string());
+    Ok(model)
+}
+
+/// Find the `static/` directory by checking common locations.
+fn find_static_dir() -> anyhow::Result<PathBuf> {
+    let exe_dir = std::env::current_exe()?
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_default();
+
+    // Locations to check, in order of preference
+    let candidates: &[fn(&PathBuf) -> PathBuf] = &[
+        |d| d.join("static"),           // next to binary    (target/release/static)
+        |d| d.join("../static"),        // one level up      (target/static)
+        |d| d.join("../../static"),     // two levels up     (project-root/static)
+    ];
+
+    for candidate_fn in candidates {
+        let candidate = candidate_fn(&exe_dir);
+        if candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+
+    // Also check current working directory
+    let cwd_static = std::env::current_dir()?.join("static");
+    if cwd_static.exists() {
+        return Ok(cwd_static);
+    }
+
+    anyhow::bail!(
+        "Static files directory not found.\n\
+         Looked next to binary, in parent directories, and in the current working directory.\n\
+         Place the static/ directory next to the binary or in the project root."
+    )
+}
+
 /// Wait for the OpenClaudia proxy to be ready by polling `/health`.
 async fn wait_for_proxy_ready(port: u16, timeout_secs: u64) -> anyhow::Result<()> {
     let url = format!("http://127.0.0.1:{port}/health");
@@ -181,34 +235,16 @@ async fn main() -> anyhow::Result<()> {
     // 4. Wait for the proxy to be ready
     wait_for_proxy_ready(proxy_port, 30).await?;
 
-    // 5. Find the static files directory (next to the binary)
-    let exe_dir = std::env::current_exe()?
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_default();
-    let static_dir = exe_dir.join("static");
-    if !static_dir.exists() {
-        // Fallback: look in the current directory
-        let cwd_static = std::env::current_dir()?.join("static");
-        if cwd_static.exists() {
-            anyhow::bail!(
-                "Static files directory not found at {}.\n\
-                 Place the static/ directory next to the binary: {}",
-                static_dir.display(),
-                exe_dir.display()
-            );
-        }
-        anyhow::bail!(
-            "Static files directory not found.\n\
-             Looked at: {}\n\
-             Looked at: {}\n\
-             Place the static/ directory next to the binary.",
-            static_dir.display(),
-            cwd_static.display()
-        );
-    }
+    // 5. Find the static files directory
+    let static_dir = find_static_dir()?;
 
-    // 6. Start the UI server
+    // 6. Resolve the configured model and inject it into the HTML
+    let default_model = resolve_config_model()?;
+    info!(%default_model, "Resolved default model from config");
+    let injected_html = std::fs::read_to_string(static_dir.join("index.html"))?
+        .replace("__DEFAULT_MODEL__", &default_model);
+
+    // 7. Start the UI server
     let proxy_base = Arc::new(format!("http://127.0.0.1:{proxy_port}"));
     let state = AppState {
         proxy_base,
@@ -216,7 +252,17 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let app = Router::new()
-        // Proxy all /v1/* requests to the internal openclaudia proxy
+        // Serve the injected index.html (with model substituted)
+        .route("/", axum::routing::get(move || {
+            let html = injected_html.clone();
+            async move {
+                Response::builder()
+                    .header("content-type", "text/html; charset=utf-8")
+                    .body(Body::from(html))
+                    .unwrap()
+            }
+        }))
+        // Proxy all API requests to the internal openclaudia proxy
         .route("/v1/{*path}", any(proxy_handler))
         .route("/health", any(proxy_handler))
         .route("/stats", any(proxy_handler))
